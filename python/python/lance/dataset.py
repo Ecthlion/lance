@@ -5827,6 +5827,66 @@ class LanceOperation:
         replacements: List[LanceOperation.DataReplacementGroup]
 
     @dataclass
+    class DataOverlayFile:
+        """
+        An overlay file supplying new values for a subset of
+        ``(physical offset, field)`` cells of a fragment, resolved on read and
+        layered over the base data without rewriting the base files.
+
+        Set exactly one of ``shared_offsets`` (a dense overlay: a single offset
+        set shared by every field in ``data_file``) or ``field_offsets`` (a
+        sparse overlay: one offset set per field, in the order of the file's
+        fields). Offsets are **physical** row offsets (positions in the base
+        files, counting deleted rows), like deletion vectors.
+
+        Attributes
+        ----------
+        data_file : DataFile
+            The Lance data file storing the overlay's new cell values — one
+            value column per covered field, with no row-offset key column. The
+            value at each covered offset is stored at the rank (0-based count of
+            covered offsets below it) of that offset in the field's coverage.
+        shared_offsets : Optional[List[int]]
+            Physical row offsets covered for every field (dense coverage).
+        field_offsets : Optional[List[List[int]]]
+            Physical row offsets covered per field, in field order (sparse
+            coverage).
+        """
+
+        data_file: DataFile
+        shared_offsets: Optional[List[int]] = None
+        field_offsets: Optional[List[List[int]]] = None
+
+    @dataclass
+    class DataOverlayGroup:
+        """
+        Overlay files to append to a single fragment.
+
+        Attributes
+        ----------
+        fragment_id : int
+            The id of the fragment the overlays apply to.
+        overlays : List[LanceOperation.DataOverlayFile]
+            The overlay files to append, ordered oldest-first (a later entry is
+            newer and wins where coverage overlaps).
+        """
+
+        fragment_id: int
+        overlays: List[LanceOperation.DataOverlayFile]
+
+    @dataclass
+    class DataOverlay(BaseOperation):
+        """
+        Operation that appends data overlay files to fragments.
+
+        Overlays are appended to each fragment's existing overlays (overlays
+        written by concurrent commits are preserved) and resolved on read,
+        newest-last, over the base data without rewriting it.
+        """
+
+        groups: List[LanceOperation.DataOverlayGroup]
+
+    @dataclass
     class Project(BaseOperation):
         """
         Operation that project columns.

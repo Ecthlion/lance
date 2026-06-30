@@ -7,11 +7,13 @@ use crate::utils::{PyLance, class_name, export_vec, extract_vec};
 use arrow::pyarrow::PyArrowType;
 use arrow_schema::Schema as ArrowSchema;
 use lance::dataset::transaction::{
-    DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction, UpdateMap,
-    UpdateMapEntry, UpdateMode,
+    DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction,
+    UpdateMap, UpdateMapEntry, UpdateMode,
 };
 use lance::datatypes::Schema;
-use lance_table::format::{BasePath, DataFile, Fragment, IndexFile, IndexMetadata};
+use lance_table::format::{
+    BasePath, DataFile, DataOverlayFile, Fragment, IndexFile, IndexMetadata, OverlayCoverage,
+};
 use pyo3::exceptions::PyValueError;
 use pyo3::types::PySet;
 use pyo3::{Bound, FromPyObject, PyAny, PyResult, Python};
@@ -206,6 +208,103 @@ impl<'py> IntoPyObject<'py> for PyLance<&DataReplacementGroup> {
     }
 }
 
+impl FromPyObject<'_, '_> for PyLance<DataOverlayFile> {
+    type Error = PyErr;
+    fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
+        let data_file = ob.getattr("data_file")?.extract::<PyLance<DataFile>>()?.0;
+        let shared_offsets = ob
+            .getattr("shared_offsets")?
+            .extract::<Option<Vec<u32>>>()?;
+        let field_offsets = ob
+            .getattr("field_offsets")?
+            .extract::<Option<Vec<Vec<u32>>>>()?;
+
+        let coverage = match (shared_offsets, field_offsets) {
+            (Some(offsets), None) => OverlayCoverage::dense(RoaringBitmap::from_iter(offsets)),
+            (None, Some(per_field)) => OverlayCoverage::sparse(
+                per_field
+                    .into_iter()
+                    .map(RoaringBitmap::from_iter)
+                    .collect(),
+            ),
+            (Some(_), Some(_)) | (None, None) => {
+                return Err(PyValueError::new_err(
+                    "DataOverlayFile requires exactly one of shared_offsets (dense coverage) \
+                     or field_offsets (sparse, per-field coverage)",
+                ));
+            }
+        };
+
+        Ok(Self(DataOverlayFile {
+            data_file,
+            coverage,
+            // The commit stamps the effective version; the value here is ignored.
+            committed_version: 0,
+        }))
+    }
+}
+
+impl<'py> IntoPyObject<'py> for PyLance<&DataOverlayFile> {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        let namespace = py
+            .import(intern!(py, "lance"))
+            .and_then(|module| module.getattr(intern!(py, "LanceOperation")))
+            .expect("Failed to import LanceOperation namespace");
+
+        let data_file = PyLance(&self.0.data_file).into_pyobject(py)?;
+        let (shared_offsets, field_offsets): (Option<Vec<u32>>, Option<Vec<Vec<u32>>>) =
+            match &self.0.coverage {
+                OverlayCoverage::Shared(bitmap) => (Some(bitmap.iter().collect()), None),
+                OverlayCoverage::PerField(bitmaps) => (
+                    None,
+                    Some(bitmaps.iter().map(|b| b.iter().collect()).collect()),
+                ),
+            };
+
+        let cls = namespace
+            .getattr("DataOverlayFile")
+            .expect("Failed to get DataOverlayFile class");
+        cls.call1((data_file, shared_offsets, field_offsets))
+    }
+}
+
+impl FromPyObject<'_, '_> for PyLance<DataOverlayGroup> {
+    type Error = PyErr;
+    fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
+        let fragment_id = ob.getattr("fragment_id")?.extract::<u64>()?;
+        let overlays = extract_vec(&ob.getattr("overlays")?)?;
+        Ok(Self(DataOverlayGroup {
+            fragment_id,
+            overlays,
+        }))
+    }
+}
+
+impl<'py> IntoPyObject<'py> for PyLance<&DataOverlayGroup> {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        let namespace = py
+            .import(intern!(py, "lance"))
+            .and_then(|module| module.getattr(intern!(py, "LanceOperation")))
+            .expect("Failed to import LanceOperation namespace");
+
+        let fragment_id = self.0.fragment_id;
+        let overlays = export_vec(py, self.0.overlays.as_slice())?;
+
+        let cls = namespace
+            .getattr("DataOverlayGroup")
+            .expect("Failed to get DataOverlayGroup class");
+        cls.call1((fragment_id, overlays))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PyUpdateMode(pub UpdateMode);
 
@@ -350,6 +449,13 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
 
                 Ok(Self(op))
             }
+            "DataOverlay" => {
+                let groups = extract_vec(&ob.getattr("groups")?)?;
+
+                let op = Operation::DataOverlay { groups };
+
+                Ok(Self(op))
+            }
             "Project" => {
                 let schema = extract_schema(&ob.getattr("schema")?)?;
 
@@ -486,6 +592,13 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     .getattr("DataReplacement")
                     .expect("Failed to get DataReplacement class");
                 cls.call1((replacements,))
+            }
+            Operation::DataOverlay { groups } => {
+                let groups = export_vec(py, groups.as_slice())?;
+                let cls = namespace
+                    .getattr("DataOverlay")
+                    .expect("Failed to get DataOverlay class");
+                cls.call1((groups,))
             }
             Operation::Delete {
                 updated_fragments,
